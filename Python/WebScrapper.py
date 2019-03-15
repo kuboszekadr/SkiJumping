@@ -2,6 +2,7 @@ import requests
 import json
 import os
 import re
+import sqlalchemy
 
 from copy import deepcopy
 from datetime import datetime
@@ -9,20 +10,95 @@ from time import sleep
 from bs4 import BeautifulSoup
 
 
-class Calendar:
-    @staticmethod
-    def download():
-        r = requests.get(Calendar.url())
-        r.encoding = 'UTF-8'
+class Meta:
+    URLS = {'contestants_list': 'https://www.skokinarciarskie.pl/m/cached/live_static_lista.html',
+            'jump_details': 'https://www.skokinarciarskie.pl/m/cached/live_gora_static.html',
+            'calendar': 'https://www.skokinarciarskie.pl/program-zawodow-w-skokach-narciarskich',
+            'live': 'https://www.skokinarciarskie.pl/skoki-na-zywo-live/'}
 
-        page_content = BeautifulSoup(r.text, 'html5lib')
+    CONTEST_TYPES = {'seria próbna': 'trial series',
+                     'konkurs ind.': 'contest',
+                     'oficjalny trening': 'trening',
+                     'kwalifikacje': 'qualifications',
+                     'konkurs druż.': 'team competition',
+                     'odprawa techniczna': 'briefing',
+                     'test skoczni': 'hill test'}
+
+    class DB:
+        SCHEMA = 'skijumping'
+
+        @staticmethod
+        def connection():
+            return sqlalchemy.create_engine('postgresql://postgres:admin@localhost:5432/postgres')
+
+        @staticmethod
+        def to_sql(rows, table_name):
+            """
+            Creates insert into query based on list of dictionary
+            :param rows: List of dictionary with keys corresponding to table columns (order not important)
+            :param table_name: table to which data shall be exported
+            :return: sql smt
+            """
+            sql_stmt_pattern = "insert into {}.{} ({}) values ".format(Meta.DB.SCHEMA,
+                                                                       table_name,
+                                                                       ','.join(['"{}"'.format(x) for x in rows[0]])
+                                                                       )
+            sql_stmts = []
+            for row in rows:
+                sql_stmt = '({})'.format(','.join("'{}'".format(x) for x in row.values()))
+                sql_stmts.append(sql_stmt)
+
+            Meta.DB.connection().execute(sql_stmt_pattern + ',\n'.join(sql_stmts))
+
+
+class Calendar:
+    def __init__(self):
+        self.__rows = []
+        self.__source = ''
+
+    @property
+    def source(self):
+        return self.__source
+
+    def download(self):
+        try:
+            r = requests.get(Calendar.url())
+            r.encoding = 'ISO 8859-2'
+            self.__source = r.text
+        except ConnectionAbortedError as e:
+            raise e
+
+        page_content = BeautifulSoup(self.source, 'html5lib')
         tables = page_content.find('div', id='sLewaDol').find_all('table', class_='prog')
 
-        calendar = []
+        self.__rows = []
         for table in tables:
-            calendar = calendar + Calendar._parse_table(table)
+            self.__rows = self.__rows + Calendar._parse_table(table)
 
-        return calendar
+        return self.__rows
+
+    @staticmethod
+    def _parse_row(row_tag):
+        dic = {}
+
+        dic['date'] = ''
+        dic['hour'] = row_tag.find('td', class_='prog_godz').text
+        dic['name'] = row_tag.find_all('td', class_='prog_event1')[0].text
+        dic['type'] = row_tag.find_all('td', class_='prog_event1')[1].text
+
+        pattern = r'[\n\t]+'
+        for entry in dic:  # removing redundant patterns in data
+            dic[entry] = re.sub(pattern, '', dic[entry])
+            dic[entry] = re.sub(' ✔', '', dic[entry])
+
+        try:
+            dic['type'] = Meta.CONTEST_TYPES[dic['type']]
+        except KeyError:  # if new contest type occurs do not map it
+            log('Can not map calendar entry:\t{}\nEntry will not be mapped'.format(dic['type']),
+                'warn')
+            pass
+
+        return dic
 
     @staticmethod
     def _parse_table(tag):
@@ -40,119 +116,265 @@ class Calendar:
         return data
 
     @staticmethod
-    def _parse_row(row_tag):
-        dic = {}
-
-        dic['date'] = ''
-        dic['hour'] = row_tag.find('td', class_='prog_godz').text
-        dic['name'] = row_tag.find_all('td', class_='prog_event1')[0].text
-        dic['type'] = row_tag.find_all('td', class_='prog_event1')[1].text
-
-        pattern = r'[\n\t]+'
-        for entry in dic:
-            dic[entry] = re.sub(pattern, '', dic[entry])
-
-        return dic
-
-    @staticmethod
     def url():
-        return Contest.URLS['calendar']
+        return Meta.URLS['calendar']
+
+    def to_sql(self):
+        Meta.DB.to_sql(self.__rows, 'calendar')
+
+    def save(self, path=''):
+        file = os.path.join(path, r'raw\calendar_{}.txt'.format(timestamp('YYYYMMDD')))
+        with open(file, 'a') as f:
+            f.write(self.source)
+
+
+class Hill:
+    def __init__(self, tag):
+        self.__name = ''
+        self.__hs = ''
+        self.__id = -1
+        self.__source = tag
+
+    @property
+    def name(self):
+        name = self.__name.replace('\n', '')
+        return name[:name.find(' HS')]
+
+    @property
+    def hs(self):
+        return self.__hs
+
+    @property
+    def id(self):
+        return self.__id
+
+    def get_data(self):
+        soup = BeautifulSoup(self.__source, 'html.parser')
+
+        header = soup.find('div', class_='live_naglowek2')
+        hill_date = header.find('div', class_='live_naglowek_a').text.split(' - ')
+
+        (self.__name, self.__hs) = hill_date[0].split('-')
+
+    def get_id(self):
+        stmt = "select id from {}.hill where name = '{}' and hs = '{}'".format(Meta.DB.SCHEMA,
+                                                                               self.name,
+                                                                               self.hs)
+        con = Meta.DB.connection()
+        id = con.execute(stmt)
+
+        if id.rowcount == 0:
+            _id = self._new(con)
+        elif id.rowcount == 1:
+            _id = id.fetchone()['id']
+        else:
+            raise KeyError
+
+        self.__id = _id
+        del con
+
+    def _new(self, con):
+        stmt = "insert into {}.hill (name, hs) values ('{}', '{}') returning id"
+        stmt = stmt.format(Meta.DB.SCHEMA, self.name, self.hs)
+
+        return con.execute(stmt).fetchone()['id']
 
 
 class Contest:
-    TYPES = {'seria próbna': 'trial',
-             'konkurs': 'contest',
-             'oficjalny trening': 'trening',
-             'kwalifikacje': 'qualifications',
-             'konkurs druż.': 'team competition'}
+    TABLE = 'contest'
 
-    URLS = {'contestants_list': 'https://www.skokinarciarskie.pl/m/cached/live_static_lista.html',
-            'jump_details': 'https://www.skokinarciarskie.pl/m/cached/live_gora_static.html',
-            'calendar': 'https://www.skokinarciarskie.pl/program-zawodow-w-skokach-narciarskich'}
+    class ContestantList:
+        def __init__(self, contest_id):
+            self.__contest_id = contest_id
+            self.__contestants = []
 
-    def __init__(self, **kwargs):
-        self.__hill = {'name': kwargs['hill'], 'hs': kwargs['hs']}
-        self.__date = kwargs['date']
-        self.__hour = kwargs['hour']
-        self.__type = kwargs['type']
-        self.__source = kwargs['soup']
+        @property
+        def contestants(self):
+            return self.__contestants
 
+        def download(self):
+            try:
+                r = requests.get(Meta.URLS['contestants_list'])
+                r.encoding = 'UTF-8'
+            except requests.exceptions.ConnectionError as e:
+                log('Can not request URL...\n' + str(e))
+                raise
+
+            soup = BeautifulSoup(r.text, 'html.parser')
+
+            # Check if page is not empty
+            if soup.text == '<!---->':
+                raise ValueError('Page empty')
+
+            rows = soup.find('tbody').find_all('tr')[1:]  # find table containing jumpers and order
+            if len(rows) == 1 and rows[0].text == '-':
+                raise ValueError
+
+            self.__contestants = []
+            for row in rows:
+                position = row.find('td', class_='poz').text
+
+                jumper = Jumper()
+                jumper.name = row.find('td', class_='zaw').text
+                jumper.get_id()
+
+                self.__contestants.append({'position': position,
+                                           'jumper': jumper.id})
+
+        def to_sql(self):
+            """
+            Exports contestants list to database replacing name with ID
+            :return:
+            """
+            if len(self.__contestants) == 0:
+                raise ValueError('No contestants available.')
+
+            # Checking if contestant list is already on database
+            stmt = "select 1 from {}.contestants where contest_id = {} limit 1".format(Meta.DB.SCHEMA,
+                                                                                       self.__contest_id)
+            if Meta.DB.connection().execute(stmt).rowcount > 0:
+                print('List for this contest is already available')
+                return
+
+            jumpers = []
+            for c in self.__contestants:
+                jumper = Jumper()
+                jumper.name = c['jumper']
+                jumper.get_id()
+
+                jumpers.append({'contest_id': self.__contest_id,
+                                'position': c['position'],
+                                'jumper_id': jumper.id})
+
+            Meta.DB.to_sql(jumpers, 'contestants')
+
+    def __init__(self, calendar_id):
+        self.__calendar_id = calendar_id
+
+        r = requests.get(Meta.URLS['live'])
+        r.encoding = 'UTF-8'
+        self.__hill = Hill(r.text)
+
+        self.__hill.get_data()
+        self.__hill.get_id()
+
+        self.__source = ''
         self.__contestants = []
         self.__left = -1
-        self.__total = -1
         self.__status = None
+        self.__type = self._get_type()
 
     @property
     def hill(self):
         return self.__hill
 
     @property
-    def date(self):
-        return self.__date
-
-    @property
-    def hour(self):
-        return self.__hour
-
-    @property
     def type(self):
         return self.__type
 
-    def validate(self):
-        raise NotImplementedError
+    def _get_type(self):
+        """
+        Checks contest table based on database entry
+        :return: Contest type
+        """
+        stmt = "select type from {}.{} where id = {}".format(Meta.DB.SCHEMA,
+                                                             'calendar',
+                                                             self.__calendar_id)
+        cursor = Meta.DB.connection().execute(stmt)
+        if cursor.rowcount > 1:
+            raise ValueError('Duplicated entry for contest id = {}'.format(self.__calendar_id))
+        elif cursor.rowcount == 0:
+            raise ValueError('Contest id = {} does not exist'.format(self.__calendar_id))
 
-    def get_data(self):
-        raise NotImplementedError
-
-        header = self.__source.find('div', class_='live_naglowek2')
-        hill_date = header.find('div', class_='live_naglowek_a').text.split(' - ')
-
-        (self.__hill['name'], self.__hill['hs']) = hill_date[0].split('-')
-        self.__date = hill_date[1]
-
-        type = header.find('div', class_='live_naglowek_b')
-        contests_in_day = [x for x in type.children][1:]
-
-        self.__type = Contest.TYPES[contests_in_day[0].text.lower()[:-1]]
-        self.__hour = contests_in_day[1].replace(',', '').strip()
+        return cursor.fetchone()['type']
 
     def monitor(self, delay=10):
-        last_jumper = ''  # initalize last jumper as empty string
-
-        # TODO: Pause loop when no contestants left in a series
-        # TODO: Exit function if two series passed
-        while True:
-            log('Checking for changes...')
-            try:
-                r = requests.get(Contest.URLS['jump_details'])
-                r.encoding = 'UTF-8'
-            except requests.exceptions.ConnectionError as e:
-                log('Can not request url...\n' + e)
-                sleep(delay*0.5)
-                continue
-            except e:
-                log('Unhandled error occurred:\n' + e)
-                continue
+        def download_jump(jumper, tag):
+            jumper.get_id()
+            jump = Jump(jumper, tag)
 
             try:
-                jump = Jump(BeautifulSoup(r.text, 'html.parser'))
                 jump.parse()
-            except e:
-                log('Unhandled error occured.\n' + str(e))
+            except AttributeError as e:
+                unhandled_error('download_jump', e, tag)
+                return
+            except Exception as e:
+                unhandled_error('download_jump', e, tag)
+                return
 
-            if jump.jumper != last_jumper:
-                log('New jump data available..')
-                last_jumper = jump.jumper
-                jump.save(r'')
-                log('Jump data:\n{}'.format(jump.print()))
-            else:
+            return jump
+
+        def unhandled_error(step, e, source=''):
+            log('Unhandled error occured during {}\n{}'.format(step, str(e)))
+
+            file = r'errors\{}_{}.txt'.format(timestamp('YYYYMMDD'), step)
+            with open(file, 'a', encoding='UTF-8') as f:
+                f.write('{}\t{}\t{}\n'.format(step, str(e), source))
+
+        last_jumper = ''  # initialize last jumper as empty string
+        while True:
+            # Check if data is available
+            try:
+                r = requests.get(Meta.URLS['jump_details'])
+                r.encoding = 'UTF-8'
+
+                jumper = Jumper()
+                jumper.get_data(r.text)
+            except AttributeError:
+                log('No jump data available yet')
+                sleep(delay)
+                continue
+            except TimeoutError:
+                log('Can not retrieve data from the server...' + str(e))
+                continue
+            except requests.exceptions.ConnectionError as e:
+                log('Can not request jump details url...', 'err')
+                continue
+            except Exception as e:
+                unhandled_error('test', e)
+
+            # Check if new data is available
+            if jumper.name == last_jumper:
                 log('No new data available...')
+                sleep(delay)
+                continue
+
+            jump = download_jump(jumper, r.text)
+            if not jump:
+                log('Error occured during parsing, please check log file.')
+                continue
+
+            log('New jump data available..')
+            last_jumper = jumper.name
+
+            jump.save()  # saves raw data and json
+            jump.to_sql(self.__calendar_id)  # export results to database
+            jump.print()
+            # Download updated list of contestants
+            try:
+                jumpers_left = Contest.ContestantList(self.__calendar_id)
+                jumpers_left.download()
+                self.__left = len(jumpers_left.contestants)
+            except ValueError:
+                self.__left = 0
+            except requests.exceptions.ConnectionError:
+                log('Can not request contestants url...')
+            except Exception as e:
+                unhandled_error('contestants', e)
+            finally:
+                log('Contestants left: {}'.format(self.__left))
+
+            if self.__left == 0 and jump.series == 2 and self.type in ['team competition', 'contest']:
+                log("Contest ended.")
+                return
+            elif self.__left == 0 and self.type not in ['team competition', 'contest']:
+                log("Contest ended.")
+                return
 
             sleep(delay)
 
     def save(self, path):
-        t = timestamp().replace(':', '').replace(' ', '')[:8]
-        file = os.path.join(path, r'results\contest_{}.txt'.format(t))
+        file = os.path.join(path, r'results\{}_{}.txt'.format(self.TABLE, timestamp('YYYYMMDD')))
 
         d = deepcopy(self.__dict__)
         del d['_Contest__source']
@@ -161,45 +383,105 @@ class Contest:
             f.write(json.dumps(d) + '\n')
 
     def save_source(self):
-        ts = timestamp().replace(' ', '').replace(':', ' ')[:8]
-        with open(r'raw\contest_source_{}.txt'.format(ts), 'a') as f:
+        with open(r'raw\contest_source_{}.txt'.format(timestamp('YYYYMMDD')), 'a') as f:
             f.write(self.__source)
             try:
-                r = requests.get(self.URLS['contestants_list'])
+                r = requests.get(Meta.URLS['contestants_list'])
                 r.encoding = 'UTF-8'
-            except requests.exceptions.ConnectionError as e:
+            except requests.exceptions.ConnectionError:
                 print('Can not request contestants_list')
                 return
             f.write(r.text)
 
-    @staticmethod
-    def contenstants_list():
-        r = requests.get(Contest.URLS['contestants_list'])
-        r.encoding = 'UTF-8'
+    def to_sql(self):
+        dic = {'calendar_id': self.__calendar_id,
+               'hill_id': self.hill.id,
+               'contestants_amount': len(self.__contestants)}
 
-        soup = BeautifulSoup(r.text, 'html.parser')
-        rows = soup.find('tbody').find_all('tr')[1:]
+        Meta.DB.to_sql(dic, 'contest')
 
-        if len(rows) == 1 and rows[0].text == '-':
-            raise ValueError
 
-        contestants = {}
-        for row in rows:
-            position = row.find('td', class_='poz').text
-            contestant = row.find('td', class_='zaw').text
-            contestants[position] = contestant
+class Jumper:
+    def __init__(self):
+        self.__name = ''
+        self.__country = ''
+        self.__id = -1
+        self.__source = ''
 
-        return contestant
+    @property
+    def name(self):
+        return self.__name
+
+    @name.setter
+    def name(self, value):
+        self.__name = value
+
+    @property
+    def country(self):
+        return self.__country
+
+    @property
+    def id(self):
+        return self.__id
+
+    def get_data(self, tag):
+        """
+        Parses jumper data
+        :param tag: html source
+        :return:
+        """
+        soup = BeautifulSoup(tag, 'html.parser')
+        table_tag = soup.find('tbody')
+
+        data_row = [x for x in table_tag.children]
+        del data_row[0]  # remove header
+
+        cols = [x for x in data_row[0].children]
+        self.__name = cols[0].text
+        self.__country = cols[1].find('img').attrs['title']
+
+    def get_id(self):
+        """
+        Retrieves jumper ID from the database, if jumper does not exist creates new entry
+        :return: jumper id
+        """
+        con = Meta.DB.connection()
+        # check if jumper exists
+        id = con.execute("select id from {}.jumper where name = '{}'".format(Meta.DB.SCHEMA, self.name))
+
+        if id.rowcount == 0:  # jumper does not exist yet
+            _id = self._new(con)  # add new jumper
+        elif id.rowcount == 1:
+            _id = id.fetchone()['id']
+        else:
+            raise KeyError('Multiple instances of jumper {} exist'.format(self.name))
+
+        self.__id = _id
+        del con
+
+    def _new(self, con):
+        """
+        Adds new jumper to database
+        :param con: connection to database
+        :return: new jumper id
+        """
+        stmt = "insert into {}.jumper (name, country) values ('{}', '{}') returning id"
+        stmt = stmt.format(Meta.DB.SCHEMA, self.__name, self.country)
+
+        return con.execute(stmt).fetchone()['id']
 
 
 class Jump:
-    def __init__(self, soup):
+    def __init__(self, jumper, tag):
         self.__points = {}
-        self.__jumper = {}
+        self.__jumper = jumper
+
         self.__length = ''
         self.__wind = ''
         self.__series = ''
-        self.__source = soup
+        self.__source = tag
+
+        self.__hard_space = '\u00a0'
 
     @property
     def jumper(self):
@@ -211,7 +493,7 @@ class Jump:
 
     @property
     def wind(self):
-        return self.__wind
+        return self.__wind[:self.__wind.find(self.__hard_space)]
 
     @property
     def bar(self):
@@ -219,7 +501,7 @@ class Jump:
 
     @property
     def speed(self):
-        return self.__speed
+        return self.__speed[:self.__speed.find(self.__hard_space)]
 
     @property
     def points(self):
@@ -229,23 +511,37 @@ class Jump:
     def series(self):
         return self.__series
 
+    def download(self):
+        """
+        Download source data from jump_details web page
+        :return:
+        """
+        r = requests.get(Meta.URLS['jump_details'])
+        r.encoding = 'UTF-8'
+        self.__source = r.text
+
     def parse(self):
-        tables = self.__source.find_all('tbody')
+        soup = BeautifulSoup(self.__source, 'html.parser')
+        tables = soup.find_all('tbody')
 
         if len(tables) == 1:
-            return  # TODO
+            raise ValueError('No data available')
 
         self._parse_summary(tables[0])
         self._parse_details(tables[1])
 
     def _parse_summary(self, tag):
+        """
+        Parses data from upper table named Ostatni Zawodnik
+        :param tag: HTML file
+        :return:
+        """
         rows = [x for x in tag.children]
-        rows = rows[1:]
+        del rows[0]
 
         row = [x for x in rows[0].children]
-        self.__jumper['name'] = row[0].text
-        self.__jumper['country'] = row[1].find('img').attrs['title']
 
+        # There is different table depending on series...
         row = row if len(rows) < 3 else [x for x in rows[2].children]
         self.__series = 1 if len(rows) < 3 else 2
 
@@ -255,21 +551,28 @@ class Jump:
     def _parse_details(self, tag):
         def parse_row(row):
             cols = [x for x in row.children]
-            return cols[1].text, cols[2].text
+            try:
+                type = cols[1].text
+                points = float(cols[2].text.replace(self.__hard_space + 'pkt', ''))
+            except ValueError:
+                points = cols[2].text
+
+            return type, points
 
         rows = [x for x in tag.find('tbody').children]
 
+        # Check if table contains referral notes
         if len(rows) == 4:
             notes_row = rows[0].find_all('td', class_='pkt')
             self.__points['notes'] = [x.text for x in notes_row][:-1]
             del rows[0]
 
-        (self.__wind, self.__points['wind']) = parse_row(rows[0])
-        (self.__bar, self.__points['bar']) = parse_row(rows[1])
-        (self.__speed, __) = parse_row(rows[2])
+        (self.__wind, self.__points['wind']) = parse_row(rows[0])  # wind power, wind points
+        (self.__bar, self.__points['bar']) = parse_row(rows[1])  # bar number, bar points
+        (self.__speed, __) = parse_row(rows[2])  # speed
 
     def print(self):
-        jumper = 'Jumper:\t{}'.format(self.jumper['name'])
+        jumper = 'Jumper:\t{}'.format(self.jumper.name)
         jump = 'Lenght:\t{}'.format(self.length)
         wind = 'Wind:\t{}'.format(self.wind)
         bar = 'Bar:\t{}'.format(self.bar)
@@ -279,28 +582,93 @@ class Jump:
 
         print('\n'.join([jumper, jump, wind, bar, speed, points]))
 
+    def to_sql(self, contest_id):
+        """
+        Exports jump data into database
+        :param contest_id: int
+        :return:
+        """
+        dic = {'jumper_id': self.jumper.id,
+               'contest_id': contest_id,
+               'series': self.series,
+               'length': self.length,
+               'bar': self.bar,
+               'bar_points': self.points['bar'],
+               'wind': self.wind,
+               'wind_points': self.points['wind'],
+               'total_points': self.points['total']}
+
+        try:
+            dic['style_points'] = ','.join(self.points['notes'])
+        except KeyError:
+            pass
+
+        Meta.DB.to_sql([dic], 'jump')
+
     def save(self, path=''):
+        """
+        Saves jump raw and parsed data into YYYYMMDD.txt file
+        :param path: root folder where data should be save
+        :return:
+        """
+        t = timestamp('YYYYMMDD')
+
+        pattern = r'{}\jumps_{}.txt'
+        self._save_results(os.path.join(path, pattern.format('results', t)))
+        self._save_source(os.path.join(path, pattern.format('raw', t)))
+
+    def _save_results(self, filepath):
+        """
+        Save jump parsing results
+        :param filepath: path to file to be appended
+        :return:
+        """
         d = deepcopy(self.__dict__)
         del d['_Jump__source']
+        del d['_Jump__jumper']
 
-        t = timestamp().replace(' ', '')[:8]
-        file = os.path.join(path, r'results\jumps_{}.txt'.format(t))
+        d['_Jump__jumper'] = self.__jumper.__dict__
 
-        with open(file, 'a', encoding='UTF-8') as f:
+        with open(filepath, 'a', encoding='UTF-8') as f:
             f.write(json.dumps(d) + '\n')
 
-    def save_source(self, path=''):
-        t = timestamp().replace(' ', '')[:8]
-        file = os.path.join(path, r'raw\jumps_{}.txt'.format(t))
-
-        with open(file, 'a') as f:
+    def _save_source(self, filepath):
+        """
+        Save source data of the jump
+        :param filepath:
+        :return:
+        """
+        with open(filepath, 'a', encoding='UTF-8') as f:
             f.write(self.__source + '\n')
 
 
-def timestamp():
+def timestamp(format=''):
     dt = datetime.now()
+    if format == 'YYYYMMDD':
+        return dt.strftime("%Y%m%d")
+
     return dt.strftime("%Y %m %d %H:%M:%S")
 
 
-def log(msg):
-    print(timestamp() + '\t' + msg)
+# TODO: Add log type fe warning, error
+def log(msg, type=''):
+    _msg = timestamp() + '\t' + msg
+    print(_msg)
+
+"""
+r = requests.get('https://www.skokinarciarskie.pl/index.php?a=wyniki&b=wyniki&cykl=ps&sezon=2018/2019&konkurs_id=8634&seria=2')
+r.encoding = 'ISO 8859-2'
+r.status_code
+
+soup = BeautifulSoup(r.text, 'html.parser')
+print(soup.prettify())
+
+header = soup.find('div', id='sLewaDol').find('table')
+rows = header.find_all('tr')[2:]
+
+row = rows[0]
+jumper_name = row.find('td', class_='zaw').text
+jumper_country = row.find('td', class_='fla').img['title']
+jumps = row.find_all('td', class_='odl')
+jumps[0]['title']
+"""
