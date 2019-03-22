@@ -9,7 +9,6 @@ from datetime import datetime
 from time import sleep
 from bs4 import BeautifulSoup
 
-
 class Meta:
     URLS = {'contestants_list': 'https://www.skokinarciarskie.pl/m/cached/live_static_lista.html',
             'jump_details': 'https://www.skokinarciarskie.pl/m/cached/live_gora_static.html',
@@ -29,7 +28,8 @@ class Meta:
 
         @staticmethod
         def connection():
-            return sqlalchemy.create_engine('postgresql://postgres:admin@localhost:5432/postgres')
+            # return sqlalchemy.create_engine('postgresql://postgres:admin@localhost:5432/postgres')
+            return sqlalchemy.create_engine('postgresql://gops:gops@localhost/gops')
 
         @staticmethod
         def to_sql(rows, table_name):
@@ -130,10 +130,14 @@ class Calendar:
 
 class Hill:
     def __init__(self, tag):
-        self.__name = ''
-        self.__hs = ''
         self.__id = -1
         self.__source = tag
+
+        soup = BeautifulSoup(tag, 'html.parser')
+        header = soup.find('div', class_='live_naglowek2')
+        hill_date = header.find('div', class_='live_naglowek_a').text.split(' - ')
+
+        (self.__name, self.__hs) = hill_date[0].split('-')
 
     @property
     def name(self):
@@ -147,14 +151,6 @@ class Hill:
     @property
     def id(self):
         return self.__id
-
-    def get_data(self):
-        soup = BeautifulSoup(self.__source, 'html.parser')
-
-        header = soup.find('div', class_='live_naglowek2')
-        hill_date = header.find('div', class_='live_naglowek_a').text.split(' - ')
-
-        (self.__name, self.__hs) = hill_date[0].split('-')
 
     def get_id(self):
         stmt = "select id from {}.hill where name = '{}' and hs = '{}'".format(Meta.DB.SCHEMA,
@@ -214,7 +210,7 @@ class Contest:
             for row in rows:
                 position = row.find('td', class_='poz').text
 
-                jumper = Jumper()
+                jumper = Jumper(parser='None')
                 jumper.name = row.find('td', class_='zaw').text
                 jumper.get_id()
 
@@ -238,7 +234,7 @@ class Contest:
 
             jumpers = []
             for c in self.__contestants:
-                jumper = Jumper()
+                jumper = Jumper(parser='None')
                 jumper.name = c['jumper']
                 jumper.get_id()
 
@@ -253,9 +249,8 @@ class Contest:
 
         r = requests.get(Meta.URLS['live'])
         r.encoding = 'UTF-8'
-        self.__hill = Hill(r.text)
 
-        self.__hill.get_data()
+        self.__hill = Hill(r.text)
         self.__hill.get_id()
 
         self.__source = ''
@@ -318,8 +313,7 @@ class Contest:
                 r = requests.get(Meta.URLS['jump_details'])
                 r.encoding = 'UTF-8'
 
-                jumper = Jumper()
-                jumper.get_data(r.text)
+                jumper = Jumper(r.text)
             except AttributeError:
                 log('No jump data available yet')
                 sleep(delay)
@@ -349,7 +343,8 @@ class Contest:
 
             jump.save()  # saves raw data and json
             jump.to_sql(self.__calendar_id)  # export results to database
-            jump.print()
+            print(jump)
+
             # Download updated list of contestants
             try:
                 jumpers_left = Contest.ContestantList(self.__calendar_id)
@@ -372,6 +367,31 @@ class Contest:
                 return
 
             sleep(delay)
+
+    @staticmethod
+    def parse_archive(url):
+        #TODO: Add exporting to SQL
+        r = requests.get(url)
+        r.encoding = 'ISO 8859-2'
+
+        soup = BeautifulSoup(r.text, 'html.parser')
+        header = soup.find('div', id='sLewaDol').find('table')
+
+        rows = header.find_all('tr')[2:]
+        for row in rows:
+            try:
+                jumper = Jumper(str(row), 'archive')
+            except Jumper.NoDataAvailableError:
+                continue
+
+            jumps = row.find_all('td', class_='odl')
+
+            for j in jumps:
+                try:
+                    jump = Jump(jumper, str(j), 'archive')
+                    print(jump)
+                except Jump.DetailedDataError:
+                    pass
 
     def save(self, path):
         file = os.path.join(path, r'results\{}_{}.txt'.format(self.TABLE, timestamp('YYYYMMDD')))
@@ -402,11 +422,39 @@ class Contest:
 
 
 class Jumper:
-    def __init__(self):
+
+    class NoDataAvailableError(Exception):
+        pass
+
+    def __init__(self, tag='', parser='online'):
         self.__name = ''
         self.__country = ''
         self.__id = -1
-        self.__source = ''
+        self.__source = tag
+
+        def online_parser(soup):
+            table_tag = soup.find('tbody')  # first table contains jumper data
+            rows = [x for x in table_tag.children]
+            del rows[0]  # remove header
+
+            cols = [x for x in rows[0].children]
+            self.__name = cols[0].text
+            self.__country = cols[1].find('img').attrs['title']
+
+        def archive_parser(soup):
+            try:
+                self.__name = soup.find('td', class_='zaw').text
+            except AttributeError:
+                if len(soup.find('tr', class_='przerwa even')) > 0:
+                    raise Jumper.NoDataAvailableError('Split row passed.')
+
+            self.__country = soup.find('td', class_='fla').img['title']
+
+        soup = BeautifulSoup(self.__source, 'html.parser')
+        if parser == 'online':
+            online_parser(soup)
+        elif parser == 'archive':
+            archive_parser(soup)
 
     @property
     def name(self):
@@ -424,55 +472,36 @@ class Jumper:
     def id(self):
         return self.__id
 
-    def get_data(self, tag):
-        """
-        Parses jumper data
-        :param tag: html source
-        :return:
-        """
-        soup = BeautifulSoup(tag, 'html.parser')
-        table_tag = soup.find('tbody')
-
-        data_row = [x for x in table_tag.children]
-        del data_row[0]  # remove header
-
-        cols = [x for x in data_row[0].children]
-        self.__name = cols[0].text
-        self.__country = cols[1].find('img').attrs['title']
-
     def get_id(self):
         """
         Retrieves jumper ID from the database, if jumper does not exist creates new entry
         :return: jumper id
         """
+        def add_new(name, country):
+            stmt = "insert into {}.jumper (name, country) values ('{}', '{}') returning id"
+            stmt = stmt.format(Meta.DB.SCHEMA, name, country)
+
+            return con.execute(stmt).fetchone()['id']
+
         con = Meta.DB.connection()
-        # check if jumper exists
         id = con.execute("select id from {}.jumper where name = '{}'".format(Meta.DB.SCHEMA, self.name))
 
-        if id.rowcount == 0:  # jumper does not exist yet
-            _id = self._new(con)  # add new jumper
+        if id.rowcount == 0:
+            _id = add_new(self.name, self.country)  # adds new jumper to dictionary
         elif id.rowcount == 1:
-            _id = id.fetchone()['id']
-        else:
+            _id = id.fetchone()['id']  # gets jumpers' id
+        else:  # just in case...
             raise KeyError('Multiple instances of jumper {} exist'.format(self.name))
 
         self.__id = _id
         del con
 
-    def _new(self, con):
-        """
-        Adds new jumper to database
-        :param con: connection to database
-        :return: new jumper id
-        """
-        stmt = "insert into {}.jumper (name, country) values ('{}', '{}') returning id"
-        stmt = stmt.format(Meta.DB.SCHEMA, self.__name, self.country)
-
-        return con.execute(stmt).fetchone()['id']
-
 
 class Jump:
-    def __init__(self, jumper, tag):
+    class DetailedDataError(Exception):
+        pass
+
+    def __init__(self, jumper, tag, parser='online'):
         self.__points = {}
         self.__jumper = jumper
 
@@ -482,6 +511,22 @@ class Jump:
         self.__source = tag
 
         self.__hard_space = '\u00a0'
+
+        if parser == 'online':
+            self._online_parser()
+        elif parser == 'archive':
+            self._archive_parser()
+
+    def __str__(self):
+        jumper = 'Jumper:\t{}'.format(self.jumper.name)
+        jump = 'Lenght:\t{}'.format(self.length)
+        wind = 'Wind:\t{}'.format(self.wind)
+        bar = 'Bar:\t{}'.format(self.bar)
+        speed = 'Speed:\t{}'.format(self.speed)
+        points = 'Points:\n'
+        points += '\n'.join(['\t{}:\t{}'.format(key, value) for (key, value) in self.points.items()])
+
+        return '\n'.join([jumper, jump, wind, bar, speed, points])
 
     @property
     def jumper(self):
@@ -511,32 +556,19 @@ class Jump:
     def series(self):
         return self.__series
 
-    def download(self):
+    def _online_parser(self):
         """
-        Download source data from jump_details web page
+        Parses data available in live-data monitor
         :return:
         """
-        r = requests.get(Meta.URLS['jump_details'])
-        r.encoding = 'UTF-8'
-        self.__source = r.text
-
-    def parse(self):
         soup = BeautifulSoup(self.__source, 'html.parser')
         tables = soup.find_all('tbody')
 
         if len(tables) == 1:
             raise ValueError('No data available')
 
-        self._parse_summary(tables[0])
-        self._parse_details(tables[1])
-
-    def _parse_summary(self, tag):
-        """
-        Parses data from upper table named Ostatni Zawodnik
-        :param tag: HTML file
-        :return:
-        """
-        rows = [x for x in tag.children]
+        summary = tables[0]
+        rows = [x for x in summary.children]
         del rows[0]
 
         row = [x for x in rows[0].children]
@@ -548,7 +580,11 @@ class Jump:
         self.__length = row[2].text
         self.__points['total'] = row[3].text
 
-    def _parse_details(self, tag):
+        # Parsing detailed table
+        # wind, length, notes etc.
+        details = tables[1]
+        rows = [x for x in details.find('tbody').children]
+
         def parse_row(row):
             cols = [x for x in row.children]
             try:
@@ -559,28 +595,41 @@ class Jump:
 
             return type, points
 
-        rows = [x for x in tag.find('tbody').children]
-
         # Check if table contains referral notes
         if len(rows) == 4:
             notes_row = rows[0].find_all('td', class_='pkt')
             self.__points['notes'] = [x.text for x in notes_row][:-1]
-            del rows[0]
+            del rows[0]  # delete notes data to make code notes-independent
 
         (self.__wind, self.__points['wind']) = parse_row(rows[0])  # wind power, wind points
         (self.__bar, self.__points['bar']) = parse_row(rows[1])  # bar number, bar points
         (self.__speed, __) = parse_row(rows[2])  # speed
 
-    def print(self):
-        jumper = 'Jumper:\t{}'.format(self.jumper.name)
-        jump = 'Lenght:\t{}'.format(self.length)
-        wind = 'Wind:\t{}'.format(self.wind)
-        bar = 'Bar:\t{}'.format(self.bar)
-        speed = 'Speed:\t{}'.format(self.speed)
-        points = 'Points:\n'
-        points += '\n'.join(['\t{}:\t{}'.format(key, value) for (key, value) in self.points.items()])
+    def _archive_parser(self):
+        """
+        Parses jump data available in archive
+        :return:
+        """
+        soup = BeautifulSoup(self.__source, 'html.parser')
+        jump = soup.find('td', class_='odl')
+        data = jump['title'].replace('\r', '').replace('\n\n', '\n').split('\n')
 
-        print('\n'.join([jumper, jump, wind, bar, speed, points]))
+        if data[0] == 'brak szczegółowych danych dla tego skoku':
+            raise Jump.DetailedDataError('No detailed data available')
+
+        bar_data = data[1]
+        self.__bar = re.search('^[0-9].', bar_data).group(0)
+
+        pattern = '[\+-\-]*[0-9]+.[0-9]+'
+        self.__points['bar'] = re.search(pattern, bar_data).group(0)
+
+        wind_data = data[3]
+        (self.__wind, self.__points['wind']) = re.findall(pattern, wind_data)
+
+        self.__speed = re.search('[0-9]+.[0-9]+', data[5]).group(0)
+        self.__points['notes'] = data[7].replace(' ', '').replace('|', ',')
+
+        self.__length = jump.text
 
     def to_sql(self, contest_id):
         """
@@ -595,10 +644,11 @@ class Jump:
                'bar': self.bar,
                'bar_points': self.points['bar'],
                'wind': self.wind,
-               'wind_points': self.points['wind'],
-               'total_points': self.points['total']}
+               'wind_points': self.points['wind']
+               }
 
         try:
+            dic['total_points'] = self.points['total']
             dic['style_points'] = ','.join(self.points['notes'])
         except KeyError:
             pass
@@ -667,8 +717,28 @@ header = soup.find('div', id='sLewaDol').find('table')
 rows = header.find_all('tr')[2:]
 
 row = rows[0]
-jumper_name = row.find('td', class_='zaw').text
-jumper_country = row.find('td', class_='fla').img['title']
+jumper = Jumper(str(row), 'archive')
+
 jumps = row.find_all('td', class_='odl')
-jumps[0]['title']
+data = jumps[0]['title'].replace('\r', '').replace('\n\n', '\n').split('\n')
+
+pattern = '[\+-\-][0-9]+.[0-9]+'
+
+bar_data = data[1]
+bar = re.search('^[0-9].', bar_data).group(0)
+bar_points = re.search(pattern, bar_data).group(0)
+
+wind_data = data[3]
+(wind_power, wind_points) = re.findall('[\+-\-][0-9]+.[0-9]+', wind_data)
+
+speed = re.search('[0-9]+.[0-9]+', data[5]).group(0)
+notes = data[7].replace(' ', '').replace('|', ',')
+
+length = jumps[0].text
 """
+
+Contest.parse_archive('https://www.skokinarciarskie.pl/index.php?a=wyniki&b=wyniki&cykl=ps&sezon=2018/2019&konkurs_id=8634&seria=2')
+
+pattern = '[\+\-]*[0-9]+\.[0-9]+'
+s = '+0.00 m/s (-1.7 pkt)'
+re.findall(pattern, s)
